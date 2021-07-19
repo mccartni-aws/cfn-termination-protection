@@ -15,11 +15,47 @@ Parameters:
     Type: String
     Description: S3 prefix path for remediation Lambda function including the Zip file name
     Default: lambdas/remediate_termination_protection.py.zip
+  
+  CFNLambdaExecutionRoleName:
+    Type: String
+    Description: Name of lambda function execution role, which will check compliance with CFN Termination Protection Config Rule.
+    Default: Cfn_Termination_Protection_Config_Rule_Role
+
+  CFNLambdaExecutionPolicyName:
+    Type: String
+    Description: Name of lambda function policy, which will check compliance with CFN Termination Protection Config Rule.
+    Default: Cfn_Termination_Protection_Config_Rule_Policy
+
+  CfnTerminationProtectionComplianceCheckLambdaName: 
+    Type: String 
+    Description: Name of lambda function to check compliance with CFN Termination Protection Config Rule.
+    Default: CfnTemplate_TerminationProtection_ComplianceCheck_Lambda
+
+  CfnTerminationProtectionConfigRuleName: 
+    Type: String
+    Description: Name of AWS config rule that checks whether a CloudFormation template has Termination Protection enabled.
+    Default: CFN_Template_Is_Termination_Protected_Config_Rule
+  
+  CfnTerminationProtectionRemediationLambdaName: 
+    Type: String 
+    Description: Name of lambda function to remediate CfnTemplateTerminationProtection ConfigRule
+    Default: CfnTemplate_TerminationProtection_Remediation_Lambda
+  
+  RemediationSSMDocName: 
+    Type: String 
+    Description: Name of SSM document that invokes the CloudFormation termination protection remediation function.
+    Default: CfnTemplate_TerminationProtection_Remediation_SSMDocument
+
+  RemediationSSMDocumentAssumeRoleName: 
+    Type: String
+    Description: Name of SSM document role that invokes the CloudFormation termination protection remediation function.
+    Default: CfnTemplate_TerminationProtection_Remediation_SSM_Role
 
 Resources:
   CFNLambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Ref CFNLambdaExecutionRoleName
       Tags:
         - Key: Description
           Value: !Sub Lambda role for compliance check and remediation - ${AWS::StackName}
@@ -34,7 +70,7 @@ Resources:
               - sts:AssumeRole
       Path: "/"
       Policies:
-        - PolicyName: Cfn_Termination_Protection_Config_Rule_Permission
+        - PolicyName: !Ref CFNLambdaExecutionPolicyName
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -56,7 +92,7 @@ Resources:
       Code:
         S3Bucket: !Ref S3BucketName
         S3Key: !Ref S3KeyPrefixComplianceCheck
-      FunctionName: CfnTemplate_TerminationProtection_ComplianceCheck
+      FunctionName: !Ref CfnTerminationProtectionComplianceCheckLambdaName
       Role: !GetAtt CFNLambdaExecutionRole.Arn
       Runtime: python3.8
       Handler: check_termination_protection.lambda_handler
@@ -73,8 +109,8 @@ Resources:
   CfnTerminationProtectionConfigRule:
     Type: AWS::Config::ConfigRule
     Properties:
-      Description: This rule checks whether a CloudFormation template has Termination Protection enabled.`
-      ConfigRuleName: CFN_Template_Is_Termination_Protected
+      Description: This rule checks whether a CloudFormation template has Termination Protection enabled.
+      ConfigRuleName: !Ref CfnTerminationProtectionConfigRuleName
       MaximumExecutionFrequency: TwentyFour_Hours #Allowed values: One_Hour | Six_Hours | Three_Hours | Twelve_Hours | TwentyFour_Hours
       Source:
         Owner: "CUSTOM_LAMBDA"
@@ -84,14 +120,14 @@ Resources:
         SourceIdentifier: !GetAtt CfnTerminationProtectionComplianceCheck.Arn
     DependsOn: ConfigPermissionToCallLambda
 
-  CfnTerminationProtectionRemediation: # TODO - CHANGE
+  CfnTerminationProtectionRemediation: 
     Type: AWS::Lambda::Function
     Properties:
       Description: Function to remediate CfnTemplateTerminationProtection ConfigRule
       Code:
         S3Bucket: !Ref S3BucketName
         S3Key: !Ref S3KeyPrefixRemediation
-      FunctionName: CfnTemplate_TerminationProtection_Remediation
+      FunctionName: !Ref CfnTerminationProtectionRemediationLambdaName
       Role: !GetAtt CFNLambdaExecutionRole.Arn
       Runtime: python3.8
       Handler: remediate_termination_protection.lambda_handler
@@ -119,14 +155,14 @@ Resources:
             timeoutSeconds: 60
             onFailure: Abort
             inputs:
-              FunctionName: !Ref CfnTerminationProtectionRemediation
+              FunctionName: !Ref CfnTerminationProtectionRemediationLambdaName
               Payload: |-
                 {
                   "ResourceId": "{{ ResourceId }}"
                 }
+      Name: !Ref RemediationSSMDocName
 
 
-  # NEXT TWO TO CHANGE
   RemediationSSMDocumentAssumeRole:
     Type: AWS::IAM::Role
     Properties:
@@ -139,6 +175,7 @@ Resources:
         Version: 2012-10-17
       ManagedPolicyArns:
         - Ref: RemediationSSMDocumentAssumeRolePolicy
+      RoleName: !Ref RemediationSSMDocumentAssumeRoleName
 
   RemediationSSMDocumentAssumeRolePolicy:
     Type: AWS::IAM::ManagedPolicy
@@ -154,7 +191,7 @@ Resources:
     Type: AWS::Config::RemediationConfiguration
     Properties:
       Automatic: True
-      ConfigRuleName: !Ref CfnTerminationProtectionConfigRule
+      ConfigRuleName: !Ref CfnTerminationProtectionConfigRuleName
       MaximumAutomaticAttempts: 10
       RetryAttemptSeconds: 60
       Parameters:
@@ -165,15 +202,15 @@ Resources:
           StaticValue:
             Values:
               - !GetAtt "RemediationSSMDocumentAssumeRole.Arn"
-      TargetId: !Ref RemediationSSMDoc
+      TargetId: !Ref RemediationSSMDocName
       TargetType: "SSM_DOCUMENT"
       TargetVersion: "1"
     DependsOn: CfnTerminationProtectionRemediation
 
 Outputs:
   RemediationLambda:
-    Value: !Ref CfnTerminationProtectionRemediation
+    Value: !Ref CfnTerminationProtectionRemediationLambdaName
   ComplianceCheckLambda:
-    Value: !Ref CfnTerminationProtectionComplianceCheck
+    Value: !Ref CfnTerminationProtectionComplianceCheckLambdaName
   RemediationSSMDoc:
-    Value: !Ref RemediationSSMDoc
+    Value: !Ref RemediationSSMDocName
