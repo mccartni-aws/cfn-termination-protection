@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: This template creates an aws custom config rule that checks whether a CFN template has termination protection enabled. If it doesn't, it remediates that.
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket where the Lambda Code is uploaded as a Zip file
+
+  S3KeyPrefixComplianceCheck: # Don't actually need, as this is just used to check the location of the source code.
+    Type: String
+    Description: S3 prefix path for Compliance Check Lambda function including the Zip file name
+    Default: lambdas/check_termination_protection.py.zip
+
+  S3KeyPrefixRemediation:
+    Type: String
+    Description: S3 prefix path for remediation Lambda function including the Zip file name
+    Default: lambdas/remediate_termination_protection.py.zip
+
+Resources:
+  CFNLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: Description
+          Value: !Sub Lambda role for compliance check and remediation - ${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: Cfn_Termination_Protection_Config_Rule_Permission
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                  - config:GetComplianceDetailsByConfigRule
+                  - cloudformation:UpdateTerminationProtection
+                  - iam:PassRole
+                Resource: "*"
+
+  CfnTerminationProtectionComplianceCheck:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Function to check compliance with CfnTerminationProtectionConfigRule
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: !Ref S3KeyPrefixComplianceCheck
+      FunctionName: CfnTemplate_TerminationProtection_ComplianceCheck
+      Role: !GetAtt CFNLambdaExecutionRole.Arn
+      Runtime: python3.8
+      Handler: check_termination_protection.lambda_handler
+      Timeout: 15 #seconds
+
+  ConfigPermissionToCallLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CfnTerminationProtectionComplianceCheck.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "config.amazonaws.com"
+      SourceAccount: !Ref "AWS::AccountId"
+
+  CfnTerminationProtectionConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      Description: This rule checks whether a CloudFormation template has Termination Protection enabled.`
+      ConfigRuleName: CFN_Template_Is_Termination_Protected
+      MaximumExecutionFrequency: TwentyFour_Hours #Allowed values: One_Hour | Six_Hours | Three_Hours | Twelve_Hours | TwentyFour_Hours
+      Source:
+        Owner: "CUSTOM_LAMBDA"
+        SourceDetails:
+          - EventSource: "aws.config"
+            MessageType: "ConfigurationItemChangeNotification"
+        SourceIdentifier: !GetAtt CfnTerminationProtectionComplianceCheck.Arn
+    DependsOn: ConfigPermissionToCallLambda
+
+  CfnTerminationProtectionRemediation: # TODO - CHANGE
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Function to remediate CfnTemplateTerminationProtection ConfigRule
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: !Ref S3KeyPrefixRemediation
+      FunctionName: CfnTemplate_TerminationProtection_Remediation
+      Role: !GetAtt CFNLambdaExecutionRole.Arn
+      Runtime: python3.8
+      Handler: remediate_termination_protection.lambda_handler
+      Timeout: 30 #seconds
+
+  RemediationSSMDoc:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        description: This document invokes the CloudFormation termination protection remediation function.
+        assumeRole: "{{ AutomationAssumeRole }}"
+        schemaVersion: "0.3" #automation documents use this version
+        parameters:
+          ResourceId:
+            type: String
+            description: Name of non-compliant resource
+          AutomationAssumeRole:
+            type: String
+            description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.
+        mainSteps:
+          - name: invokeRemediationFunction
+            action: aws:invokeLambdaFunction
+            maxAttempts: 3
+            timeoutSeconds: 60
+            onFailure: Abort
+            inputs:
+              FunctionName: !Ref CfnTerminationProtectionRemediation
+              Payload: |-
+                {
+                  "ResourceId": "{{ ResourceId }}"
+                }
+
+
+  # NEXT TWO TO CHANGE
+  RemediationSSMDocumentAssumeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - Ref: RemediationSSMDocumentAssumeRolePolicy
+
+  RemediationSSMDocumentAssumeRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: lambda:InvokeFunction
+            Effect: Allow
+            Resource: !GetAtt "CfnTerminationProtectionRemediation.Arn"
+
+  GlueDataCatalogRemediationConfiguration:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      Automatic: True
+      ConfigRuleName: !Ref CfnTerminationProtectionConfigRule
+      MaximumAutomaticAttempts: 10
+      RetryAttemptSeconds: 60
+      Parameters:
+        ResourceId:
+          ResourceValue:
+            Value: "RESOURCE_ID"
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt "RemediationSSMDocumentAssumeRole.Arn"
+      TargetId: !Ref RemediationSSMDoc
+      TargetType: "SSM_DOCUMENT"
+      TargetVersion: "1"
+    DependsOn: CfnTerminationProtectionRemediation
+
+Outputs:
+  RemediationLambda:
+    Value: !Ref CfnTerminationProtectionRemediation
+  ComplianceCheckLambda:
+    Value: !Ref CfnTerminationProtectionComplianceCheck
+  RemediationSSMDoc:
+    Value: !Ref RemediationSSMDoc
